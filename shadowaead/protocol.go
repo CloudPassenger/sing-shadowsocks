@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"io"
 	"net"
+	"os"
 
 	"github.com/sagernet/sing-shadowsocks"
 	"github.com/sagernet/sing/common"
@@ -26,28 +27,39 @@ var List = []string{
 	"xchacha20-ietf-poly1305",
 }
 
+type methodSpec struct {
+	keySaltLength int
+	constructor   func(key []byte) (cipher.AEAD, error)
+}
+
+func parseMethod(method string) (methodSpec, error) {
+	switch method {
+	case "aes-128-gcm":
+		return methodSpec{16, aeadCipher(aes.NewCipher, cipher.NewGCM)}, nil
+	case "aes-192-gcm":
+		return methodSpec{24, aeadCipher(aes.NewCipher, cipher.NewGCM)}, nil
+	case "aes-256-gcm":
+		return methodSpec{32, aeadCipher(aes.NewCipher, cipher.NewGCM)}, nil
+	case "chacha20-ietf-poly1305":
+		return methodSpec{32, chacha20poly1305.New}, nil
+	case "xchacha20-ietf-poly1305":
+		return methodSpec{32, chacha20poly1305.NewX}, nil
+	default:
+		return methodSpec{}, os.ErrInvalid
+	}
+}
+
 var _ shadowsocks.Method = (*Method)(nil)
 
 func New(method string, key []byte, password string) (*Method, error) {
-	m := &Method{
-		name: method,
+	spec, err := parseMethod(method)
+	if err != nil {
+		return nil, err
 	}
-	switch method {
-	case "aes-128-gcm":
-		m.keySaltLength = 16
-		m.constructor = aeadCipher(aes.NewCipher, cipher.NewGCM)
-	case "aes-192-gcm":
-		m.keySaltLength = 24
-		m.constructor = aeadCipher(aes.NewCipher, cipher.NewGCM)
-	case "aes-256-gcm":
-		m.keySaltLength = 32
-		m.constructor = aeadCipher(aes.NewCipher, cipher.NewGCM)
-	case "chacha20-ietf-poly1305":
-		m.keySaltLength = 32
-		m.constructor = chacha20poly1305.New
-	case "xchacha20-ietf-poly1305":
-		m.keySaltLength = 32
-		m.constructor = chacha20poly1305.NewX
+	m := &Method{
+		name:          method,
+		keySaltLength: spec.keySaltLength,
+		constructor:   spec.constructor,
 	}
 	if len(key) == m.keySaltLength {
 		m.key = key
@@ -64,6 +76,69 @@ func New(method string, key []byte, password string) (*Method, error) {
 func Kdf(key, iv []byte, buffer *buf.Buffer) {
 	kdf := hkdf.New(sha1.New, key, iv, []byte("ss-subkey"))
 	common.Must1(buffer.ReadFullFrom(kdf, buffer.FreeLen()))
+}
+
+const (
+	legacyHKDFInfo   = "ss-subkey"
+	maxLegacyKeySize = 32
+)
+
+type legacyHKDF struct {
+	extractInner [sha1.BlockSize]byte
+	extractOuter [sha1.BlockSize]byte
+	scratch      [sha1.BlockSize + maxLegacyKeySize]byte
+}
+
+func (kdf *legacyHKDF) Reset(salt []byte) {
+	for index := 0; index < sha1.BlockSize; index++ {
+		kdf.extractInner[index] = 0x36
+		kdf.extractOuter[index] = 0x5c
+	}
+	for index, value := range salt {
+		kdf.extractInner[index] ^= value
+		kdf.extractOuter[index] ^= value
+	}
+}
+
+func (kdf *legacyHKDF) Derive(key []byte, output []byte) {
+	copy(kdf.scratch[:sha1.BlockSize], kdf.extractInner[:])
+	copy(kdf.scratch[sha1.BlockSize:], key)
+	inner := sha1.Sum(kdf.scratch[:sha1.BlockSize+len(key)])
+
+	copy(kdf.scratch[:sha1.BlockSize], kdf.extractOuter[:])
+	copy(kdf.scratch[sha1.BlockSize:], inner[:])
+	prk := sha1.Sum(kdf.scratch[:sha1.BlockSize+sha1.Size])
+
+	block := kdf.expand(prk, nil, 1)
+	written := copy(output, block[:])
+	if written < len(output) {
+		block = kdf.expand(prk, block[:], 2)
+		copy(output[written:], block[:])
+	}
+}
+
+func (kdf *legacyHKDF) expand(key [sha1.Size]byte, previous []byte, counter byte) [sha1.Size]byte {
+	for index := 0; index < sha1.BlockSize; index++ {
+		kdf.scratch[index] = 0x36
+	}
+	for index, value := range key {
+		kdf.scratch[index] ^= value
+	}
+	offset := sha1.BlockSize
+	offset += copy(kdf.scratch[offset:], previous)
+	offset += copy(kdf.scratch[offset:], legacyHKDFInfo)
+	kdf.scratch[offset] = counter
+	offset++
+	inner := sha1.Sum(kdf.scratch[:offset])
+
+	for index := 0; index < sha1.BlockSize; index++ {
+		kdf.scratch[index] = 0x5c
+	}
+	for index, value := range key {
+		kdf.scratch[index] ^= value
+	}
+	copy(kdf.scratch[sha1.BlockSize:], inner[:])
+	return sha1.Sum(kdf.scratch[:sha1.BlockSize+sha1.Size])
 }
 
 func aeadCipher(block func(key []byte) (cipher.Block, error), aead func(block cipher.Block) (cipher.AEAD, error)) func(key []byte) (cipher.AEAD, error) {
