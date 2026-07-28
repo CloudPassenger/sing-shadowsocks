@@ -16,24 +16,35 @@ import (
 	"github.com/sagernet/sing-shadowsocks"
 	"github.com/sagernet/sing-shadowsocks/shadowaead"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/cache"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/rw"
 
 	"lukechampine.com/blake3"
 )
 
 var _ shadowsocks.MultiService[int] = (*MultiService[int])(nil)
 
-type MultiService[U comparable] struct {
-	*Service
-
+type multiUserState[U comparable] struct {
 	uPSK     map[U][]byte
 	uPSKHash map[[aes.BlockSize]byte]U
 	uCipher  map[U]cipher.Block
+}
+
+// PreparedUsers is a complete immutable multi-user authentication state.
+type PreparedUsers[U comparable] struct {
+	state *multiUserState[U]
+}
+
+type MultiService[U comparable] struct {
+	*Service
+
+	users       atomic.TypedValue[*multiUserState[U]]
+	udpSessions *cache.LruCache[uint64, *multiServerUDPSession[U]]
 }
 
 func NewMultiServiceWithPassword[U comparable](method string, password string, udpTimeout int64, handler shadowsocks.Handler, timeFunc func() time.Time) (*MultiService[U], error) {
@@ -62,57 +73,97 @@ func NewMultiService[U comparable](method string, iPSK []byte, udpTimeout int64,
 
 	s := &MultiService[U]{
 		Service: ss.(*Service),
-
+		udpSessions: cache.New[uint64, *multiServerUDPSession[U]](
+			cache.WithAge[uint64, *multiServerUDPSession[U]](udpTimeout),
+			cache.WithUpdateAgeOnGet[uint64, *multiServerUDPSession[U]](),
+		),
+	}
+	s.users.Store(&multiUserState[U]{
 		uPSK:     make(map[U][]byte),
 		uPSKHash: make(map[[aes.BlockSize]byte]U),
-	}
+		uCipher:  make(map[U]cipher.Block),
+	})
 	return s, nil
 }
 
-func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
-	uPSK := make(map[U][]byte)
-	uPSKHash := make(map[[aes.BlockSize]byte]U)
-	uCipher := make(map[U]cipher.Block)
-	for i, user := range userList {
-		key := keyList[i]
-		if len(key) < s.keySaltLength {
-			return shadowsocks.ErrBadKey
-		} else if len(key) > s.keySaltLength {
-			key = Key(key, s.keySaltLength)
-		}
-
-		var hash [aes.BlockSize]byte
-		hash512 := blake3.Sum512(key)
-		copy(hash[:], hash512[:])
-
-		uPSKHash[hash] = user
-		uPSK[user] = key
-		var err error
-		uCipher[user], err = s.blockConstructor(key)
-		if err != nil {
-			return err
-		}
+// PrepareUsers validates and compiles a complete immutable authentication state.
+func (s *MultiService[U]) PrepareUsers(userList []U, keyList [][]byte) (*PreparedUsers[U], error) {
+	if len(userList) != len(keyList) {
+		return nil, E.New("user and key list length mismatch")
 	}
 
-	s.uPSK = uPSK
-	s.uPSKHash = uPSKHash
-	s.uCipher = uCipher
+	state := &multiUserState[U]{
+		uPSK:     make(map[U][]byte, len(userList)),
+		uPSKHash: make(map[[aes.BlockSize]byte]U, len(userList)),
+		uCipher:  make(map[U]cipher.Block, len(userList)),
+	}
+	for index, user := range userList {
+		if _, loaded := state.uPSK[user]; loaded {
+			return nil, E.New("duplicate user")
+		}
+
+		key := keyList[index]
+		if len(key) != s.keySaltLength {
+			return nil, shadowsocks.ErrBadKey
+		}
+		keyCopy := make([]byte, len(key))
+		copy(keyCopy, key)
+
+		var hash [aes.BlockSize]byte
+		hash512 := blake3.Sum512(keyCopy)
+		copy(hash[:], hash512[:])
+		if _, loaded := state.uPSKHash[hash]; loaded {
+			return nil, E.New("duplicate user psk")
+		}
+
+		userCipher, err := s.blockConstructor(keyCopy)
+		if err != nil {
+			return nil, err
+		}
+		state.uPSKHash[hash] = user
+		state.uPSK[user] = keyCopy
+		state.uCipher[user] = userCipher
+	}
+	return &PreparedUsers[U]{state: state}, nil
+}
+
+// PrepareUsersWithPasswords decodes and compiles a complete immutable authentication state.
+func (s *MultiService[U]) PrepareUsersWithPasswords(userList []U, passwordList []string) (*PreparedUsers[U], error) {
+	keyList := make([][]byte, 0, len(passwordList))
+	for _, password := range passwordList {
+		if password == "" {
+			return nil, shadowsocks.ErrMissingPassword
+		}
+		uPSK, err := base64.StdEncoding.DecodeString(password)
+		if err != nil {
+			return nil, E.Cause(err, "decode psk")
+		}
+		keyList = append(keyList, uPSK)
+	}
+	return s.PrepareUsers(userList, keyList)
+}
+
+// PublishUsers atomically installs a prepared authentication state.
+func (s *MultiService[U]) PublishUsers(users *PreparedUsers[U]) {
+	s.users.Store(users.state)
+}
+
+func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
+	users, err := s.PrepareUsers(userList, keyList)
+	if err != nil {
+		return err
+	}
+	s.PublishUsers(users)
 	return nil
 }
 
 func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
-	keyList := make([][]byte, 0, len(passwordList))
-	for _, password := range passwordList {
-		if password == "" {
-			return shadowsocks.ErrMissingPassword
-		}
-		uPSK, err := base64.StdEncoding.DecodeString(password)
-		if err != nil {
-			return E.Cause(err, "decode psk")
-		}
-		keyList = append(keyList, uPSK)
+	users, err := s.PrepareUsersWithPasswords(userList, passwordList)
+	if err != nil {
+		return err
 	}
-	return s.UpdateUsers(userList, keyList)
+	s.PublishUsers(users)
+	return nil
 }
 
 func (s *MultiService[U]) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
@@ -161,12 +212,16 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	}
 	b.Decrypt(eiHeader, eiHeader)
 
+	userState := s.users.Load()
 	var user U
-	var uPSK []byte
-	if u, loaded := s.uPSKHash[_eiHeader]; loaded {
-		user = u
-		uPSK = s.uPSK[u]
-	} else {
+	uPSK, loaded := []byte(nil), false
+	if userState != nil {
+		if authenticatedUser, userLoaded := userState.uPSKHash[_eiHeader]; userLoaded {
+			user = authenticatedUser
+			uPSK, loaded = userState.uPSK[authenticatedUser]
+		}
+	}
+	if !loaded {
 		return ErrInvalidRequest
 	}
 
@@ -190,7 +245,7 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return err
 	}
 
-	headerType, err := rw.ReadByte(reader)
+	headerType, err := reader.ReadByte()
 	if err != nil {
 		return E.Cause(err, "read header")
 	}
@@ -273,44 +328,38 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 
 	packetHeader := buffer.To(aes.BlockSize)
 	s.udpBlockCipher.Decrypt(packetHeader, packetHeader)
+	sessionId := binary.BigEndian.Uint64(packetHeader[:8])
 
-	var _eiHeader [aes.BlockSize]byte
-	eiHeader := _eiHeader[:]
-	s.udpBlockCipher.Decrypt(eiHeader, buffer.Range(aes.BlockSize, 2*aes.BlockSize))
-	xorWords(eiHeader, eiHeader, packetHeader)
-
-	var user U
-	var uPSK []byte
-	if u, loaded := s.uPSKHash[_eiHeader]; loaded {
-		user = u
-		uPSK = s.uPSK[u]
-	} else {
-		return E.New("invalid request")
-	}
-
-	var sessionId, packetId uint64
-	err := binary.Read(buffer, binary.BigEndian, &sessionId)
-	if err != nil {
-		return err
-	}
-	err = binary.Read(buffer, binary.BigEndian, &packetId)
-	if err != nil {
-		return err
-	}
-
-	buffer.Advance(aes.BlockSize)
-
-	session, loaded := s.udpSessions.LoadOrStore(sessionId, func() *serverUDPSession {
-		return s.newUDPSession(uPSK)
-	})
+	session, loaded := s.udpSessions.Load(sessionId)
 	if !loaded {
-		session.remoteSessionId = sessionId
-		key := SessionKey(uPSK, packetHeader[:8], s.keySaltLength)
-		session.remoteCipher, err = s.constructor(key)
+		var _eiHeader [aes.BlockSize]byte
+		eiHeader := _eiHeader[:]
+		s.udpBlockCipher.Decrypt(eiHeader, buffer.Range(aes.BlockSize, 2*aes.BlockSize))
+		xorWords(eiHeader, eiHeader, packetHeader)
+
+		userState := s.users.Load()
+		if userState == nil {
+			return ErrInvalidRequest
+		}
+		user, userLoaded := userState.uPSKHash[_eiHeader]
+		if !userLoaded {
+			return ErrInvalidRequest
+		}
+		uPSK := userState.uPSK[user]
+		userCipher := userState.uCipher[user]
+
+		candidate, err := s.newUDPSession(user, uPSK, userCipher, sessionId)
 		if err != nil {
 			return err
 		}
+		session, loaded = s.udpSessions.LoadOrStore(sessionId, func() *multiServerUDPSession[U] {
+			return candidate
+		})
 	}
+
+	var err error
+	packetId := binary.BigEndian.Uint64(packetHeader[8:])
+	buffer.Advance(2 * aes.BlockSize)
 
 	goto process
 
@@ -374,14 +423,38 @@ process:
 
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
+	//nolint:staticcheck // MultiService preserves the sing v0.6 UDP handler contract.
 	s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
-		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, s.uCipher[user]}
+		return auth.ContextWithUser(ctx, session.user), &serverPacketWriter{
+			Service:        s.Service,
+			source:         conn,
+			nat:            natConn,
+			session:        session.serverUDPSession,
+			udpBlockCipher: session.userCipher,
+		}
 	})
 	return nil
 }
 
-func (s *MultiService[U]) newUDPSession(uPSK []byte) *serverUDPSession {
-	session := &serverUDPSession{}
+type multiServerUDPSession[U comparable] struct {
+	*serverUDPSession
+	user       U
+	userCipher cipher.Block
+}
+
+func (s *MultiService[U]) newUDPSession(
+	user U,
+	uPSK []byte,
+	userCipher cipher.Block,
+	remoteSessionId uint64,
+) (*multiServerUDPSession[U], error) {
+	session := &multiServerUDPSession[U]{
+		serverUDPSession: &serverUDPSession{
+			remoteSessionId: remoteSessionId,
+		},
+		user:       user,
+		userCipher: userCipher,
+	}
 	if s.udpCipher != nil {
 		session.rng = Blake3KeyedHash(rand.Reader)
 		common.Must(binary.Read(session.rng, binary.BigEndian, &session.sessionId))
@@ -389,11 +462,22 @@ func (s *MultiService[U]) newUDPSession(uPSK []byte) *serverUDPSession {
 		common.Must(binary.Read(rand.Reader, binary.BigEndian, &session.sessionId))
 	}
 	session.packetId--
-	sessionId := make([]byte, 8)
-	binary.BigEndian.PutUint64(sessionId, session.sessionId)
-	key := SessionKey(uPSK, sessionId, s.keySaltLength)
-	var err error
+
+	var remoteSessionIdBytes [8]byte
+	binary.BigEndian.PutUint64(remoteSessionIdBytes[:], remoteSessionId)
+	remoteKey := SessionKey(uPSK, remoteSessionIdBytes[:], s.keySaltLength)
+	remoteCipher, err := s.constructor(remoteKey)
+	if err != nil {
+		return nil, err
+	}
+	session.remoteCipher = remoteCipher
+
+	var sessionIdBytes [8]byte
+	binary.BigEndian.PutUint64(sessionIdBytes[:], session.sessionId)
+	key := SessionKey(uPSK, sessionIdBytes[:], s.keySaltLength)
 	session.cipher, err = s.constructor(key)
-	common.Must(err)
-	return session
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
 }
