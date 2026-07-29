@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/aes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-shadowsocks"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -195,6 +199,143 @@ func TestMultiServiceConcurrentAuthenticationAndUpdates(t *testing.T) {
 		t.Fatal(raceErr)
 	}
 }
+
+func TestMultiServiceUDPRevalidatesUsersOnSessionReuse(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	timeFunc := func() time.Time { return now }
+	iPSK := bytes.Repeat([]byte{0x71}, 16)
+	oldKey := bytes.Repeat([]byte{0x72}, 16)
+	newKey := bytes.Repeat([]byte{0x73}, 16)
+	service, err := NewMultiService[string](
+		"2022-blake3-aes-128-gcm",
+		iPSK,
+		60,
+		atomicTestHandler{},
+		timeFunc,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.UpdateUsers([]string{"alice"}, [][]byte{oldKey}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldMethod := newMultiUDPTestMethod(t, iPSK, oldKey, timeFunc)
+	oldSession := oldMethod.newUDPSession()
+	sessionID := oldSession.sessionId
+	initialPacket := encodeMultiUDPTestPacket(t, oldMethod, oldSession, "initial")
+	if err := service.newPacket(context.Background(), nil, initialPacket, M.Metadata{}); err != nil {
+		initialPacket.Release()
+		t.Fatal(err)
+	}
+
+	if err := service.UpdateUsers([]string{"alice"}, [][]byte{newKey}); err != nil {
+		t.Fatal(err)
+	}
+	newMethod := newMultiUDPTestMethod(t, iPSK, newKey, timeFunc)
+	newSession := newMultiUDPTestSession(t, newMethod, sessionID)
+	rotatedPacket := encodeMultiUDPTestPacket(t, newMethod, newSession, "rotated")
+	if err := service.newPacket(context.Background(), nil, rotatedPacket, M.Metadata{}); err != nil {
+		rotatedPacket.Release()
+		t.Fatal(err)
+	}
+	cached, loaded := service.udpSessions.Load(sessionID)
+	if !loaded || cached.snapshot != service.users.Load().snapshot || cached.user != "alice" {
+		t.Fatal("rotated credential did not replace the cached UDP session identity")
+	}
+
+	oldPacket := encodeMultiUDPTestPacket(t, oldMethod, oldSession, "old-after-rotation")
+	if err := service.newPacket(context.Background(), nil, oldPacket, M.Metadata{}); err == nil {
+		t.Fatal("old credential reused a cached UDP session after rotation")
+	} else {
+		oldPacket.Release()
+	}
+	if err := service.UpdateUsers(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	deletedPacket := encodeMultiUDPTestPacket(t, newMethod, newSession, "after-delete")
+	if err := service.newPacket(context.Background(), nil, deletedPacket, M.Metadata{}); err == nil {
+		t.Fatal("deleted credential reused a cached UDP session")
+	} else {
+		deletedPacket.Release()
+	}
+}
+
+func newMultiUDPTestMethod(
+	t *testing.T,
+	iPSK []byte,
+	userKey []byte,
+	timeFunc func() time.Time,
+) *Method {
+	t.Helper()
+	method, err := New("2022-blake3-aes-128-gcm", [][]byte{iPSK, userKey}, timeFunc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return method.(*Method)
+}
+
+func newMultiUDPTestSession(t *testing.T, method *Method, sessionID uint64) *udpSession {
+	t.Helper()
+	session := method.newUDPSession()
+	session.sessionId = sessionID
+	var sessionIDBytes [8]byte
+	binary.BigEndian.PutUint64(sessionIDBytes[:], sessionID)
+	key := SessionKey(method.pskList[len(method.pskList)-1], sessionIDBytes[:], method.keySaltLength)
+	var err error
+	session.cipher, err = method.constructor(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func encodeMultiUDPTestPacket(
+	t *testing.T,
+	method *Method,
+	session *udpSession,
+	payload string,
+) *buf.Buffer {
+	t.Helper()
+	capture := new(packetCaptureConn)
+	client := &clientPacketConn{Method: method, Conn: capture, session: session}
+	packet := buf.NewPacket()
+	packet.Resize(client.FrontHeadroom(), 0)
+	_, err := packet.Write([]byte(payload))
+	if err != nil {
+		packet.Release()
+		t.Fatal(err)
+	}
+	if err := client.WritePacket(packet, M.ParseSocksaddr("example.com:443")); err != nil {
+		t.Fatal(err)
+	}
+	encoded := buf.NewSize(len(capture.packet))
+	_, err = encoded.Write(capture.packet)
+	if err != nil {
+		encoded.Release()
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+type packetCaptureConn struct {
+	packet []byte
+}
+
+func (c *packetCaptureConn) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (c *packetCaptureConn) Write(packet []byte) (int, error) {
+	c.packet = append(c.packet[:0], packet...)
+	return len(packet), nil
+}
+
+func (c *packetCaptureConn) Close() error                     { return nil }
+func (c *packetCaptureConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *packetCaptureConn) RemoteAddr() net.Addr             { return &net.UDPAddr{} }
+func (c *packetCaptureConn) SetDeadline(time.Time) error      { return nil }
+func (c *packetCaptureConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *packetCaptureConn) SetWriteDeadline(time.Time) error { return nil }
 
 func validateMultiUserState(state *multiUserState[string], keyA, keyB []byte) error {
 	if state == nil {

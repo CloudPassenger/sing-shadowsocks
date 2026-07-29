@@ -23,6 +23,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/udpnat"
 
 	"lukechampine.com/blake3"
 )
@@ -30,9 +31,15 @@ import (
 var _ shadowsocks.MultiService[int] = (*MultiService[int])(nil)
 
 type multiUserState[U comparable] struct {
+	snapshot *byte
 	uPSK     map[U][]byte
 	uPSKHash map[[aes.BlockSize]byte]U
 	uCipher  map[U]cipher.Block
+}
+
+type multiUDPSessionKey[U comparable] struct {
+	sessionID uint64
+	snapshot  *byte
 }
 
 // PreparedUsers is a complete immutable multi-user authentication state.
@@ -44,6 +51,7 @@ type MultiService[U comparable] struct {
 	*Service
 
 	users       atomic.TypedValue[*multiUserState[U]]
+	udpNat      *udpnat.Service[multiUDPSessionKey[U]]
 	udpSessions *cache.LruCache[uint64, *multiServerUDPSession[U]]
 }
 
@@ -73,12 +81,14 @@ func NewMultiService[U comparable](method string, iPSK []byte, udpTimeout int64,
 
 	s := &MultiService[U]{
 		Service: ss.(*Service),
+		udpNat:  udpnat.New[multiUDPSessionKey[U]](udpTimeout, handler),
 		udpSessions: cache.New[uint64, *multiServerUDPSession[U]](
 			cache.WithAge[uint64, *multiServerUDPSession[U]](udpTimeout),
 			cache.WithUpdateAgeOnGet[uint64, *multiServerUDPSession[U]](),
 		),
 	}
 	s.users.Store(&multiUserState[U]{
+		snapshot: new(byte),
 		uPSK:     make(map[U][]byte),
 		uPSKHash: make(map[[aes.BlockSize]byte]U),
 		uCipher:  make(map[U]cipher.Block),
@@ -93,6 +103,7 @@ func (s *MultiService[U]) PrepareUsers(userList []U, keyList [][]byte) (*Prepare
 	}
 
 	state := &multiUserState[U]{
+		snapshot: new(byte),
 		uPSK:     make(map[U][]byte, len(userList)),
 		uPSKHash: make(map[[aes.BlockSize]byte]U, len(userList)),
 		uCipher:  make(map[U]cipher.Block, len(userList)),
@@ -330,17 +341,21 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 	s.udpBlockCipher.Decrypt(packetHeader, packetHeader)
 	sessionId := binary.BigEndian.Uint64(packetHeader[:8])
 
+	userState := s.users.Load()
+	if userState == nil {
+		return ErrInvalidRequest
+	}
 	session, loaded := s.udpSessions.Load(sessionId)
+	if loaded && session.snapshot != userState.snapshot {
+		s.udpSessions.Delete(sessionId)
+		loaded = false
+	}
 	if !loaded {
 		var _eiHeader [aes.BlockSize]byte
 		eiHeader := _eiHeader[:]
 		s.udpBlockCipher.Decrypt(eiHeader, buffer.Range(aes.BlockSize, 2*aes.BlockSize))
 		xorWords(eiHeader, eiHeader, packetHeader)
 
-		userState := s.users.Load()
-		if userState == nil {
-			return ErrInvalidRequest
-		}
 		user, userLoaded := userState.uPSKHash[_eiHeader]
 		if !userLoaded {
 			return ErrInvalidRequest
@@ -348,7 +363,7 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 		uPSK := userState.uPSK[user]
 		userCipher := userState.uCipher[user]
 
-		candidate, err := s.newUDPSession(user, uPSK, userCipher, sessionId)
+		candidate, err := s.newUDPSession(userState, user, uPSK, userCipher, sessionId)
 		if err != nil {
 			return err
 		}
@@ -428,7 +443,7 @@ process:
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
 	//nolint:staticcheck // MultiService preserves the sing v0.6 UDP handler contract.
-	s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
+	s.udpNat.NewContextPacket(ctx, multiUDPSessionKey[U]{sessionID: sessionId, snapshot: userState.snapshot}, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
 		return auth.ContextWithUser(ctx, session.user), &serverPacketWriter{
 			Service:        s.Service,
 			source:         conn,
@@ -442,11 +457,13 @@ process:
 
 type multiServerUDPSession[U comparable] struct {
 	*serverUDPSession
+	snapshot   *byte
 	user       U
 	userCipher cipher.Block
 }
 
 func (s *MultiService[U]) newUDPSession(
+	userState *multiUserState[U],
 	user U,
 	uPSK []byte,
 	userCipher cipher.Block,
@@ -456,6 +473,7 @@ func (s *MultiService[U]) newUDPSession(
 		serverUDPSession: &serverUDPSession{
 			remoteSessionId: remoteSessionId,
 		},
+		snapshot:   userState.snapshot,
 		user:       user,
 		userCipher: userCipher,
 	}
