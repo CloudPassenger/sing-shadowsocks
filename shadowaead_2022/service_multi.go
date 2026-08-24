@@ -1,6 +1,7 @@
 package shadowaead_2022
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -40,11 +41,6 @@ type multiUserState[U comparable] struct {
 type multiUDPSessionKey[U comparable] struct {
 	sessionID uint64
 	snapshot  *byte
-}
-
-// PreparedUsers is a complete immutable multi-user authentication state.
-type PreparedUsers[U comparable] struct {
-	state *multiUserState[U]
 }
 
 type MultiService[U comparable] struct {
@@ -96,8 +92,37 @@ func NewMultiService[U comparable](method string, iPSK []byte, udpTimeout int64,
 	return s, nil
 }
 
-// PrepareUsers validates and compiles a complete immutable authentication state.
-func (s *MultiService[U]) PrepareUsers(userList []U, keyList [][]byte) (*PreparedUsers[U], error) {
+// UpdateUsers compiles a complete immutable authentication state and publishes it
+// with a single atomic store, so concurrent handshakes never observe a partially
+// applied user set. A rejected update leaves the published state untouched.
+func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
+	state, err := s.compileUsers(userList, keyList)
+	if err != nil {
+		return err
+	}
+	s.users.Store(state)
+	return nil
+}
+
+func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
+	keyList := make([][]byte, 0, len(passwordList))
+	for _, password := range passwordList {
+		if password == "" {
+			return shadowsocks.ErrMissingPassword
+		}
+		uPSK, err := base64.StdEncoding.DecodeString(password)
+		if err != nil {
+			return E.Cause(err, "decode psk")
+		}
+		keyList = append(keyList, uPSK)
+	}
+	return s.UpdateUsers(userList, keyList)
+}
+
+// compileUsers builds one complete authentication state without publishing it.
+// The state owns every key it references, so a published generation can never be
+// mutated through the caller's slices.
+func (s *MultiService[U]) compileUsers(userList []U, keyList [][]byte) (*multiUserState[U], error) {
 	if len(userList) != len(keyList) {
 		return nil, E.New("user and key list length mismatch")
 	}
@@ -109,72 +134,28 @@ func (s *MultiService[U]) PrepareUsers(userList []U, keyList [][]byte) (*Prepare
 		uCipher:  make(map[U]cipher.Block, len(userList)),
 	}
 	for index, user := range userList {
-		if _, loaded := state.uPSK[user]; loaded {
-			return nil, E.New("duplicate user")
-		}
-
 		key := keyList[index]
-		if len(key) != s.keySaltLength {
+		if len(key) < s.keySaltLength {
 			return nil, shadowsocks.ErrBadKey
+		} else if len(key) > s.keySaltLength {
+			key = Key(key, s.keySaltLength)
+		} else {
+			key = bytes.Clone(key)
 		}
-		keyCopy := make([]byte, len(key))
-		copy(keyCopy, key)
 
 		var hash [aes.BlockSize]byte
-		hash512 := blake3.Sum512(keyCopy)
+		hash512 := blake3.Sum512(key)
 		copy(hash[:], hash512[:])
-		if _, loaded := state.uPSKHash[hash]; loaded {
-			return nil, E.New("duplicate user psk")
-		}
 
-		userCipher, err := s.blockConstructor(keyCopy)
+		userCipher, err := s.blockConstructor(key)
 		if err != nil {
 			return nil, err
 		}
 		state.uPSKHash[hash] = user
-		state.uPSK[user] = keyCopy
+		state.uPSK[user] = key
 		state.uCipher[user] = userCipher
 	}
-	return &PreparedUsers[U]{state: state}, nil
-}
-
-// PrepareUsersWithPasswords decodes and compiles a complete immutable authentication state.
-func (s *MultiService[U]) PrepareUsersWithPasswords(userList []U, passwordList []string) (*PreparedUsers[U], error) {
-	keyList := make([][]byte, 0, len(passwordList))
-	for _, password := range passwordList {
-		if password == "" {
-			return nil, shadowsocks.ErrMissingPassword
-		}
-		uPSK, err := base64.StdEncoding.DecodeString(password)
-		if err != nil {
-			return nil, E.Cause(err, "decode psk")
-		}
-		keyList = append(keyList, uPSK)
-	}
-	return s.PrepareUsers(userList, keyList)
-}
-
-// PublishUsers atomically installs a prepared authentication state.
-func (s *MultiService[U]) PublishUsers(users *PreparedUsers[U]) {
-	s.users.Store(users.state)
-}
-
-func (s *MultiService[U]) UpdateUsers(userList []U, keyList [][]byte) error {
-	users, err := s.PrepareUsers(userList, keyList)
-	if err != nil {
-		return err
-	}
-	s.PublishUsers(users)
-	return nil
-}
-
-func (s *MultiService[U]) UpdateUsersWithPasswords(userList []U, passwordList []string) error {
-	users, err := s.PrepareUsersWithPasswords(userList, passwordList)
-	if err != nil {
-		return err
-	}
-	s.PublishUsers(users)
-	return nil
+	return state, nil
 }
 
 func (s *MultiService[U]) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
