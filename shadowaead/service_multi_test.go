@@ -29,40 +29,34 @@ func TestNewMultiServiceRejectsUnknownMethod(t *testing.T) {
 	}
 }
 
-func TestMultiServiceFailedPrepareKeepsPublishedState(t *testing.T) {
+func TestMultiServiceFailedUpdateKeepsPublishedState(t *testing.T) {
 	service := newMultiServiceTestService(t, &multiServiceTestHandler{})
 	if err := service.UpdateUsersWithPasswords([]string{"alice"}, []string{"alice-password"}); err != nil {
 		t.Fatal(err)
 	}
 	published := service.users.Load()
 
-	if _, err := service.PrepareUsers([]string{"alice", "bob"}, [][]byte{{0x01}}); err == nil {
+	if err := service.UpdateUsers([]string{"alice", "bob"}, [][]byte{{0x01}}); err == nil {
 		t.Fatal("mismatched user and key lists were accepted")
 	}
 	if service.users.Load() != published {
-		t.Fatal("failed PrepareUsers changed the published state")
+		t.Fatal("mismatched update changed the published state")
 	}
-	if _, err := service.PrepareUsers([]string{"alice"}, [][]byte{{0x01}}); err == nil {
+	if err := service.UpdateUsers([]string{"alice"}, [][]byte{{0x01}}); err == nil {
 		t.Fatal("wrong-length key was accepted")
 	}
 	if service.users.Load() != published {
-		t.Fatal("invalid key preparation changed the published state")
+		t.Fatal("invalid key update changed the published state")
 	}
-	if _, err := service.PrepareUsersWithPasswords([]string{"alice", "bob"}, []string{"alice-password"}); err == nil {
+	if err := service.UpdateUsersWithPasswords([]string{"alice", "bob"}, []string{"alice-password"}); err == nil {
 		t.Fatal("mismatched user and password lists were accepted")
 	}
 	if service.users.Load() != published {
-		t.Fatal("failed password preparation changed the published state")
-	}
-	if err := service.UpdateUsers([]string{"alice"}, [][]byte{{0x01}}); err == nil {
-		t.Fatal("failed UpdateUsers accepted an invalid key")
-	}
-	if service.users.Load() != published {
-		t.Fatal("failed UpdateUsers changed the published state")
+		t.Fatal("failed password update changed the published state")
 	}
 }
 
-func TestMultiServicePrepareDeepCopiesKeys(t *testing.T) {
+func TestMultiServiceUpdateDeepCopiesKeys(t *testing.T) {
 	handler := newMultiServiceCaptureHandler()
 	service := newMultiServiceTestService(t, handler)
 	key := make([]byte, 16)
@@ -70,16 +64,14 @@ func TestMultiServicePrepareDeepCopiesKeys(t *testing.T) {
 		key[index] = byte(index + 1)
 	}
 	originalKey := append([]byte(nil), key...)
-	prepared, err := service.PrepareUsers([]string{"alice"}, [][]byte{key})
-	if err != nil {
+	if err := service.UpdateUsers([]string{"alice"}, [][]byte{key}); err != nil {
 		t.Fatal(err)
 	}
 	key[0] ^= 0xff
-	service.PublishUsers(prepared)
 
 	payload := []byte("deep-copy")
 	request := makeMultiServiceTCPRequest(t, "aes-128-gcm", originalKey, "", payload)
-	if err = runMultiServiceTCP(service, request, "alice"); err != nil {
+	if err := runMultiServiceTCP(service, request, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	result := receiveMultiServiceTCPResult(t, handler)
@@ -91,43 +83,42 @@ func TestMultiServicePrepareDeepCopiesKeys(t *testing.T) {
 	}
 }
 
-func TestMultiServicePrepareRejectsDuplicates(t *testing.T) {
+func TestMultiServiceUpdateDuplicateHandling(t *testing.T) {
 	service := newMultiServiceTestService(t, &multiServiceTestHandler{})
 	keyA := bytes.Repeat([]byte{0x11}, 16)
-	keyB := bytes.Repeat([]byte{0x22}, 16)
 
-	if _, err := service.PrepareUsers([]string{"alice", "alice"}, [][]byte{keyA, keyB}); err == nil {
-		t.Fatal("duplicate user was accepted")
+	// Upstream parity: duplicate users and credentials are published as-is, and
+	// the first matching candidate wins. sing-box rejects duplicates before the
+	// managed-user transaction commits.
+	if err := service.UpdateUsers([]string{"alice", "bob"}, [][]byte{keyA, keyA}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := service.PrepareUsers([]string{"alice", "bob"}, [][]byte{keyA, keyA}); err == nil {
-		t.Fatal("duplicate credential was accepted")
+	state := service.users.Load()
+	if len(state.candidates) != 2 {
+		t.Fatalf("published candidate count = %d, want 2", len(state.candidates))
 	}
-	if _, err := service.PrepareUsersWithPasswords([]string{"alice", "bob"}, []string{"same-password", "same-password"}); err == nil {
-		t.Fatal("duplicate derived credential was accepted")
-	}
-	if _, err := service.PrepareUsersWithPasswords([]string{"alice"}, []string{""}); err == nil {
+	if err := service.UpdateUsersWithPasswords([]string{"alice"}, []string{""}); err == nil {
 		t.Fatal("empty password was accepted")
 	}
 }
 
-func TestMultiServicePreservesPreparedOrder(t *testing.T) {
+func TestMultiServicePreservesPublishedOrder(t *testing.T) {
 	service := newMultiServiceTestService(t, &multiServiceTestHandler{})
 	users := []string{"user-z", "user-a", "user-m"}
-	prepared, err := service.PrepareUsersWithPasswords(users, []string{"password-z", "password-a", "password-m"})
-	if err != nil {
+	if err := service.UpdateUsersWithPasswords(
+		users,
+		[]string{"password-z", "password-a", "password-m"},
+	); err != nil {
 		t.Fatal(err)
 	}
-	for index, candidate := range prepared.state.candidates {
+	state := service.users.Load()
+	for index, candidate := range state.candidates {
 		if candidate.user != users[index] {
 			t.Fatalf("candidate %d = %q, want %q", index, candidate.user, users[index])
 		}
 	}
-	service.PublishUsers(prepared)
-	if service.users.Load() != prepared.state {
-		t.Fatal("PublishUsers did not install the prepared state atomically")
-	}
-	if prepared.state.hot.Load() != nil {
-		t.Fatal("newly prepared state inherited a hot candidate")
+	if state.hot.Load() != nil {
+		t.Fatal("newly published state inherited a hot candidate")
 	}
 }
 
@@ -230,11 +221,9 @@ func TestMultiServiceHotHintIsStateLocal(t *testing.T) {
 		t.Fatal("failed authentication changed the hot hint")
 	}
 
-	prepared, err := service.PrepareUsersWithPasswords(users, passwords)
-	if err != nil {
+	if err := service.UpdateUsersWithPasswords(users, passwords); err != nil {
 		t.Fatal(err)
 	}
-	service.PublishUsers(prepared)
 	newState := service.users.Load()
 	if newState == oldState {
 		t.Fatal("new generation reused the old state")

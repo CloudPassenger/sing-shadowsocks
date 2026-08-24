@@ -54,22 +54,22 @@ func TestMultiServicePublishesCompleteUserState(t *testing.T) {
 	if service.users.Load() != previous {
 		t.Fatal("malformed-password update changed the published state")
 	}
-	if err := service.UpdateUsers([]string{"alice", "bob"}, [][]byte{keyA, keyA}); err == nil {
-		t.Fatal("duplicate user PSK was accepted")
-	}
-	if service.users.Load() != previous {
-		t.Fatal("duplicate-key update changed the published state")
-	}
-
-	preparedKey := append([]byte(nil), keyA...)
-	prepared, err := service.PrepareUsers([]string{"alice"}, [][]byte{preparedKey})
-	if err != nil {
+	// Upstream parity: duplicate user PSKs are published as-is; sing-box rejects
+	// them before the managed-user transaction commits.
+	if err := service.UpdateUsers([]string{"alice", "bob"}, [][]byte{keyA, keyA}); err != nil {
 		t.Fatal(err)
 	}
-	preparedKey[0] ^= 0xff
-	service.PublishUsers(prepared)
+	if service.users.Load() == previous {
+		t.Fatal("duplicate-key update did not publish a new state")
+	}
+
+	callerKey := append([]byte(nil), keyA...)
+	if err := service.UpdateUsers([]string{"alice"}, [][]byte{callerKey}); err != nil {
+		t.Fatal(err)
+	}
+	callerKey[0] ^= 0xff
 	if !bytes.Equal(service.users.Load().uPSK["alice"], keyA) {
-		t.Fatal("prepared state retained caller-owned key memory")
+		t.Fatal("published state retained caller-owned key memory")
 	}
 
 	states := []struct {
